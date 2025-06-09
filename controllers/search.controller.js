@@ -1,79 +1,93 @@
 import axios from "axios";
-import cloudinary from "../configs/cloudinary.js";
 import dotenv from 'dotenv';
-import streamifier from 'streamifier';
 import sharp from "sharp";
-import { searchQdrant } from "../libs/qdrant.search.js";
-import qdrant from "../configs/qdrant.js";
-import { getCroppedImage } from "../libs/crop.image.js";
-import { streamUpload } from "../libs/upload.image.js";
+import * as libs from '../libs/index.js';
 
 dotenv.config();
 
 const SearchController = {
 
-searchByImage: async (req, res, next) => {
-  try {
-    if (!req.file) return next(); // base64 not handled here
+  searchByImage: async (req, res, next) => {
+    try {
+      if (!req.file) return next();
 
-    const userId = req.headers['x-user-id'];
-    const page = parseInt(req.query.page || "1");
-    const perPage = parseInt(req.query.perPage || "250");
-    const allowedTypes = ["png", "jpg", "jpeg"];
-    const fileType = req.file.mimetype.split('/')[1].toLowerCase();
-    let embedding = req.body.embedding || null
+      const userId = req.headers['x-user-id'];
+      const page = parseInt(req.query.page || "1");
+      const perPage = parseInt(req.query.perPage || "250");
+      const allowedTypes = ["png", "jpg", "jpeg"];
+      const fileType = req.file.mimetype.split('/')[1].toLowerCase();
+      let embedding = req.body.embedding || null
+      const { price = null, color = null, category = null } = req.query;
 
-    if (!allowedTypes.includes(fileType)) {
-      return res.status(400).json({ message: "Uploaded file must be an image (png, jpg, jpeg)" });
-    }
+      if (!allowedTypes.includes(fileType)) {
+        return res.status(400).json({ message: "Uploaded file must be an image (png, jpg, jpeg)" });
+      }
 
-    const limitMb = parseFloat(process.env.IMAGE_SIZE_LIMIT || "5");
-    const MB = 1024 * 1024;
-    if (req.file.size / MB >= limitMb) {
-      req.file.buffer = await sharp(req.file.buffer)
-        .resize({ width: 1024 })
-        .jpeg({ quality: 70 })
-        .toBuffer();
-    }
+      const filter = { should: [] };
+      if (price) {
+        filter.should.push({
+          key: 'price',
+          range: { gte: parseFloat(price) }
+        });
+      }
+      if (color) {
+        filter.should.push({
+          key: 'color',
+          match: { value: color }
+        });
+      }
+      if (category) {
+        filter.should.push({
+          key: 'category',
+          match: { value: category }
+        })
+      }
 
-    const start = (page - 1) * perPage;
-    const end = start + perPage;
+      const limitMb = parseFloat(process.env.IMAGE_SIZE_LIMIT || "5");
+      const MB = 1024 * 1024;
+      if (req.file.size / MB >= limitMb) {
+        req.file.buffer = await sharp(req.file.buffer)
+          .resize({ width: 1024 })
+          .jpeg({ quality: 70 })
+          .toBuffer();
+      }
 
-    let imageUrl;
-    if (!embedding) {
-      const result = await streamUpload(req);
-      imageUrl = result.url;
+      let imageUrl;
+      if (!embedding) {
+        const result = await libs.streamUpload(req);
+        imageUrl = result.url;
 
-      const clipResponse = await axios.post(process.env.CLIP_IMAGE_ENDPOINT, {
-        images: [imageUrl]
+        const clipResponse = await axios.post(process.env.CLIP_IMAGE_ENDPOINT, {
+          images: [imageUrl]
+        });
+
+        embedding = clipResponse.data.embeddings;
+      }
+
+      const results = await libs.searchQdrant(embedding, {
+        limit: perPage,
+        offset: page,
+        filter,
+        with_vector: true
       });
 
-      embedding = clipResponse.data.embeddings;
+      await axios.post(process.env.HISTORY_ENDPOINT, {
+        image: imageUrl
+      }, {
+        headers: { 'x-user-id': userId }
+      });
+
+      const response = libs.formatQdrantResults(results)
+
+      return res.json({
+        results: response
+      });
+
+    } catch (error) {
+      console.error("Search by image error:", error?.response?.data || error);
+      return res.status(500).json({ message: "Failed to process image with CLIP." });
     }
-
-    const results = await searchQdrant(embedding, {
-      limit: perPage,
-      offset: page
-    });
-
-    const paginationResults = results.slice(start, end);
-
-    await axios.post(process.env.HISTORY_ENDPOINT, {
-      image: imageUrl
-    }, {
-      headers: { 'x-user-id': userId }
-    });
-
-    return res.json({
-      imageUrl,
-      results: paginationResults
-    });
-
-  } catch (error) {
-    console.error("Search by image error:", error?.response?.data || error.message);
-    return res.status(500).json({ message: "Failed to process image with CLIP." });
-  }
-},
+  },
 
   searchByText: async (req, res) => {
     try {
@@ -108,18 +122,18 @@ searchByImage: async (req, res, next) => {
 
       if (!embedding) {
         const clipResponse = await axios.post(process.env.CLIP_TEXT_ENDPOINT, { text: text });
-  
+
         embedding = clipResponse.data.embeddings;
       }
 
       const offset = (page - 1) * perPage;
-      const results = await searchQdrant(embedding, { limit: perPage, offset, filter });
+      const results = await libs.searchQdrant(embedding, { limit: perPage, offset, filter, with_vector: true });
 
       await axios.post(process.env.HISTORY_ENDPOINT, { text: text }, { headers: { 'x-user-id': userId } });
+      const response = libs.formatQdrantResults(results)
 
       res.json({
-        text: text,
-        results: results
+        results: response
       });
 
     } catch (error) {
@@ -172,10 +186,10 @@ searchByImage: async (req, res, next) => {
 
       let imageUrl;
       if (!embedding) {
-        const result = await streamUpload(req);
+        const result = await libs.streamUpload(req);
         imageUrl = result.url;
 
-        const croppedImage = await getCroppedImage(userId, imageUrl, text)
+        const croppedImage = await libs.getCroppedImage(userId, imageUrl, text)
 
         const clipResponse = await axios.post(
           process.env.CLIP_COMBINED_ENDPOINT,
@@ -186,7 +200,10 @@ searchByImage: async (req, res, next) => {
       }
 
       const offset = (page - 1) * perPage;
-      const results = await searchQdrant(embedding, { limit: perPage, offset, filter });
+      const results = await libs.searchQdrant(embedding, { limit: perPage, offset, filter, with_vector: true });
+
+      const response = libs.formatQdrantResults(results)
+
 
       await axios.post(
         process.env.HISTORY_ENDPOINT,
@@ -194,7 +211,7 @@ searchByImage: async (req, res, next) => {
         { headers: { 'x-user-id': userId } }
       );
 
-      res.json({ results });
+      res.json({ results: response });
 
     } catch (error) {
       console.error("Search by image and text error:", error);
@@ -208,7 +225,7 @@ searchByImage: async (req, res, next) => {
       if (isNaN(id)) return res.status(400).json({ message: "Invalid ID parameter" });
 
       const page = parseInt(req.query.page || "1");
-      const perPage = parseInt(req.query.perPage || "50");
+      const perPage = parseInt(req.query.perPage || "250");
       const { price = null, color = null, category = null } = req.query;
 
       const filter = { should: [] };
@@ -231,7 +248,7 @@ searchByImage: async (req, res, next) => {
         })
       }
 
-      const [point] = await qdrant.retrieve(process.env.QDRANT_COLLECTION, {
+      const [point] = await libs.qdrant.retrieve(process.env.QDRANT_COLLECTION, {
         ids: [id],
         with_vector: true,
       });
@@ -247,7 +264,7 @@ searchByImage: async (req, res, next) => {
       }
 
       const offset = (page - 1) * perPage;
-      const results = await qdrant.search(process.env.QDRANT_COLLECTION, {
+      const results = await libs.qdrant.search(process.env.QDRANT_COLLECTION, {
         vector,
         with_vector: true,
         limit: perPage,
@@ -255,7 +272,9 @@ searchByImage: async (req, res, next) => {
         filter,
       });
 
-      res.json({ results });
+      const response = libs.formatQdrantResults(results)
+
+      res.json({ results: response });
     } catch (error) {
       console.error("Find similar by ID error:", error);
       res.status(500).json({ error: 'Internal server error' });
